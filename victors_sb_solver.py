@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+"""
+victors_sb_solver.py
+Dedicated 100% Cloud Turnstile Solver & Referral Qualification Engine for Victor's Company (@Victors_Company_bot).
+Runs in GitHub Actions / Cloud VMs using SeleniumBase UC Mode + CDP Stealth (Zero Phone Load).
+Bypasses Cloudflare Turnstile natively without requiring paid third-party APIs.
+Qualifies all fleet recruits under Master referral ref_9DB8C58014.
+"""
+
+import os
+import sys
+import json
+import time
+import struct
+import hashlib
+import base64
+import urllib.parse
+import urllib.request
+import logging
+from datetime import datetime, timezone
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("victors_sb_solver")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+from turso_mesh import turso_get, turso_set, turso_delete, turso_keys, turso_execute
+
+TURSO_URL = os.getenv("TURSO_DB_URL") or os.getenv("TURSO_DATABASE_URL") or os.getenv("TURSO_URL") or "https://my-agy-fleet-db-aaa2743.aws-ap-south-1.turso.io"
+TURSO_TOKEN = os.getenv("TURSO_DB_TOKEN") or ""
+ALERT_BOT_TOKEN = os.getenv("ALERT_BOT_TOKEN") or os.getenv("ADMIN_BOT_TOKEN") or os.getenv("REPORT_BOT_TOKEN") or ""
+OWNER_ID = os.getenv("OWNER_ID") or "6727787768"
+
+VICTORS_SITEKEY = "0x4AAAAAAFD0KRgPRFVwDvgn"
+VICTORS_ORIGIN = "https://app.victors.company"
+VICTORS_API = "https://server.victors.company/api"
+VICTORS_REF = "ref_9DB8C58014"
+
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
+
+
+def load_all_fleet_uids() -> list:
+    """Dynamically discovers all fleet UIDs from accounts.json, Upstash Redis, or cloud sync without hardcoded limits."""
+    # 0. On-demand target account override
+    target_env = os.getenv("TARGET_ACCOUNT", "").strip()
+    if target_env and target_env.lower() != "all":
+        try:
+            logger.info(f"🎯 Specific target account requested via TARGET_ACCOUNT: {target_env}")
+            return [int(target_env)]
+        except ValueError:
+            pass
+
+    # 1. Local accounts.json
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                accs = json.load(f)
+                uids = [int(a.get("user_id") or a.get("account_id") or a.get("id")) for a in accs if (a.get("user_id") or a.get("account_id") or a.get("id"))]
+                if uids:
+                    return uids
+        except Exception:
+            pass
+
+    # 2. Dynamic discovery from Turso LibSQL kv_mesh
+    try:
+        keys = turso_keys("fleet:tokens:%")
+        if keys:
+            uids = sorted(list(set(int(k.split(":")[-1]) for k in keys if k.split(":")[-1].isdigit())))
+            if uids:
+                return uids
+    except Exception:
+        pass
+
+    # 3. Fallback roster
+    return [
+        6727787768, 7648254021, 8826375659, 8450010161, 8782429452,
+        7734849205, 8025472383, 8851426148, 8203342513, 8190649727,
+        7487048946, 8741547543, 8727040932, 7749125802, 7954290138,
+        8841038141, 8975442879, 8937908003, 8609131528, 8669217201,
+        9272631973, 9106746905, 8972499908, 9253913886, 9105319675,
+        9082822460
+    ]
+
+FLEET_UIDS = load_all_fleet_uids()
+
+
+def send_tg_alert(text: str):
+    """Sends notification to Owner Telegram & Admin Notification Channel."""
+    if not ALERT_BOT_TOKEN:
+        return
+    targets = list(set([t for t in [OWNER_ID, os.getenv("ADMIN_NOTIFICATION_CHANNEL_ID", "-1004358687850")] if t]))
+    for chat_id in targets:
+        try:
+            url = f"https://api.telegram.org/bot{ALERT_BOT_TOKEN}/sendMessage"
+            payload = json.dumps({
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            logger.warning(f"Failed to send Telegram alert to {chat_id}: {e}")
+
+
+def robust_json_loads(val):
+    """Recursively unpack double/triple-serialized JSON strings safely into Python objects."""
+    for _ in range(4):
+        if isinstance(val, str):
+            val = val.strip()
+            if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")) or (val.startswith('\"') and val.endswith('\"')):
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    break
+            else:
+                break
+        else:
+            break
+    return val
+
+
+def load_fleet_ton_wallets() -> dict:
+    """Fetch fleet TON wallets from local JSON, Turso LibSQL SSOT, or Upstash Redis."""
+    local_path = os.path.join(BASE_DIR, "fleet_ton_wallets.json")
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+        except Exception:
+            pass
+
+    # 1. Primary: Turso LibSQL SSOT
+    if TURSO_URL and TURSO_TOKEN:
+        try:
+            t_http = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+            t_req = json.dumps({
+                "requests": [
+                    {"type": "execute", "stmt": {"sql": "SELECT val FROM kv_mesh WHERE key = 'fleet:wallets:ton' LIMIT 1;", "args": []}},
+                    {"type": "close"}
+                ]
+            }).encode()
+            req = urllib.request.Request(t_http, data=t_req, headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                results = data.get("results", [])
+                if results:
+                    rows = results[0].get("response", {}).get("result", {}).get("rows", [])
+                    if rows:
+                        raw_v = rows[0][0].get("value")
+                        if raw_v:
+                            d = robust_json_loads(raw_v)
+                            if isinstance(d, dict) and d:
+                                return d
+        except Exception:
+            pass
+
+    # 2. Secondary: Turso LibSQL SSOT
+    try:
+        w = turso_get("fleet:wallets:ton")
+        if isinstance(w, dict) and w:
+            return w
+    except Exception:
+        pass
+    return {}
+
+
+def load_all_miniapp_tokens() -> dict:
+    """Fetch miniapp_tokens master dictionary from local file, Turso LibSQL SSOT, or Upstash Redis."""
+    local_path = os.path.join(BASE_DIR, "fleet_miniapp_tokens.json")
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+        except Exception:
+            pass
+
+    # 1. Primary: Turso LibSQL SSOT (zero rate limits, 25M ops/mo)
+    if TURSO_URL and TURSO_TOKEN:
+        try:
+            t_http = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+            t_req = json.dumps({
+                "requests": [
+                    {"type": "execute", "stmt": {"sql": "SELECT val FROM kv_mesh WHERE key = 'miniapp_tokens' OR key = 'fleet:tokens_state' LIMIT 1;", "args": []}},
+                    {"type": "close"}
+                ]
+            }).encode()
+            req = urllib.request.Request(t_http, data=t_req, headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                results = data.get("results", [])
+                if results:
+                    rows = results[0].get("response", {}).get("result", {}).get("rows", [])
+                    if rows:
+                        raw_v = rows[0][0].get("value")
+                        if raw_v:
+                            d = robust_json_loads(raw_v)
+                            if isinstance(d, dict) and d:
+                                return d
+        except Exception as e_t:
+            logger.debug(f"Turso miniapp_tokens fetch note: {e_t}")
+
+    return {}
+
+
+def get_token_from_turso(uid: int) -> dict:
+    """Fetch tokens for a specific account from Turso LibSQL Primary SSOT."""
+    # 1. Primary: Turso LibSQL SSOT (zero rate limits)
+    if TURSO_URL and TURSO_TOKEN:
+        try:
+            t_http = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+            t_req = json.dumps({
+                "requests": [
+                    {"type": "execute", "stmt": {"sql": "SELECT val FROM kv_mesh WHERE key = ? LIMIT 1;", "args": [{"type": "text", "value": f"fleet:tokens:{uid}"}]}},
+                    {"type": "execute", "stmt": {"sql": "SELECT val FROM kv_mesh WHERE key = ? LIMIT 1;", "args": [{"type": "text", "value": f"fleet:tokens:{uid}:victors_init_data"}]}},
+                    {"type": "close"}
+                ]
+            }).encode()
+            req = urllib.request.Request(t_http, data=t_req, headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                results = data.get("results", [])
+                if results:
+                    rows0 = results[0].get("response", {}).get("result", {}).get("rows", [])
+                    if rows0:
+                        raw_v = rows0[0][0].get("value")
+                        if raw_v:
+                            d = robust_json_loads(raw_v)
+                            if isinstance(d, dict) and d:
+                                return d
+                    if len(results) > 1:
+                        rows1 = results[1].get("response", {}).get("result", {}).get("rows", [])
+                        if rows1:
+                            raw_v1 = rows1[0][0].get("value")
+                            if raw_v1 and isinstance(raw_v1, str):
+                                return {"victors_init_data": raw_v1}
+        except Exception as te:
+            logger.debug(f"Turso token fetch note for UID {uid}: {te}")
+
+    return {}
+
+get_token_from_upstash = get_token_from_turso
+
+
+def get_victors_pass_from_turso(uid: int) -> str:
+    """Fetch saved humanPass from Turso LibSQL SSOT."""
+    # 1. Primary: Turso LibSQL SSOT (zero rate limits)
+    if TURSO_URL and TURSO_TOKEN:
+        try:
+            t_http = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+            t_req = json.dumps({
+                "requests": [
+                    {"type": "execute", "stmt": {"sql": "SELECT val FROM kv_mesh WHERE key = ? OR key = 'victors:pass:6727787768' ORDER BY key = ? DESC LIMIT 1;", "args": [{"type": "text", "value": f"victors:pass:{uid}"}, {"type": "text", "value": f"victors:pass:{uid}"}]}},
+                    {"type": "execute", "stmt": {"sql": "SELECT val FROM kv_mesh WHERE key = 'miniapp_tokens' LIMIT 1;", "args": []}},
+                    {"type": "close"}
+                ]
+            }).encode()
+            req = urllib.request.Request(t_http, data=t_req, headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                results = data.get("results", [])
+                if results and results[0].get("type") == "ok":
+                    rows = results[0].get("response", {}).get("result", {}).get("rows", [])
+                    if rows:
+                        r_val = rows[0][0]["value"]
+                        d = robust_json_loads(r_val)
+                        if isinstance(d, dict) and d.get("humanPass"):
+                            return d["humanPass"]
+                        elif isinstance(d, str) and len(d) > 10:
+                            return d
+                if len(results) > 1 and results[1].get("type") == "ok":
+                    m_rows = results[1].get("response", {}).get("result", {}).get("rows", [])
+                    if m_rows:
+                        m_val = robust_json_loads(m_rows[0][0]["value"])
+                        if isinstance(m_val, dict):
+                            u_d = m_val.get(str(uid), {})
+                            hp = u_d.get("victors_pass") or u_d.get("victors_human_pass")
+                            if hp:
+                                return hp
+        except Exception:
+            pass
+
+    return None
+
+get_victors_pass_from_upstash = get_victors_pass_from_turso
+
+
+def mark_victors_referral_bound(uid: int):
+    """Marks account as referral bound in Turso LibSQL."""
+    # Turso LibSQL update
+    if TURSO_URL and TURSO_TOKEN:
+        try:
+            t_http = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+            t_req = json.dumps({
+                "requests": [
+                    {"type": "execute", "stmt": {"sql": "UPDATE kv_mesh SET val = json_set(val, '$.victors_referral_bound', true) WHERE key = ?;", "args": [{"type": "text", "value": f"account:{uid}"}]}},
+                    {"type": "close"}
+                ]
+            }).encode()
+            req = urllib.request.Request(t_http, data=t_req, headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=6):
+                pass
+        except Exception:
+            pass
+
+    # Update local accounts.json if present
+    acc_path = os.path.join(BASE_DIR, "accounts.json")
+    if os.path.exists(acc_path):
+        try:
+            with open(acc_path, "r", encoding="utf-8") as f:
+                accounts = json.load(f)
+            modified = False
+            for a in accounts:
+                if str(a.get("user_id") or a.get("account_id")) == str(uid):
+                    a["victors_referral_bound"] = True
+                    a["vic_referral_bound"] = True
+                    modified = True
+                    break
+            if modified:
+                with open(acc_path, "w", encoding="utf-8") as f:
+                    json.dump(accounts, f, indent=2)
+        except Exception:
+            pass
+
+
+def save_victors_pass_to_turso(uid: int, human_pass: str):
+    """Saves valid Victor's Company humanPass to Turso LibSQL SSOT."""
+    if not human_pass:
+        return
+
+    val = json.dumps({"humanPass": human_pass, "updated_at": time.time()})
+
+    # 1. Primary: Turso LibSQL SSOT
+    if TURSO_URL and TURSO_TOKEN:
+        try:
+            t_http = TURSO_URL.replace("libsql://", "https://") + "/v2/pipeline"
+            now_ts_str = str(int(time.time()))
+            t_req = json.dumps({
+                "requests": [
+                    {"type": "execute", "stmt": {
+                        "sql": "INSERT OR REPLACE INTO kv_mesh (key, val, updated_at) VALUES (?, ?, ?);",
+                        "args": [{"type": "text", "value": f"victors:pass:{uid}"}, {"type": "text", "value": val}, {"type": "integer", "value": now_ts_str}]
+                    }},
+                    {"type": "execute", "stmt": {
+                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.' || ? || '.victors_pass', ?) WHERE key = 'miniapp_tokens';",
+                        "args": [{"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}]
+                    }},
+                    {"type": "execute", "stmt": {
+                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.' || ? || '.victors_pass', ?) WHERE key = 'fleet:tokens_state';",
+                        "args": [{"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}]
+                    }},
+                    {"type": "close"}
+                ]
+            }).encode()
+            req = urllib.request.Request(t_http, data=t_req, headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=6):
+                pass
+            logger.info(f"✅ Saved Victor's pass for {uid} to Turso LibSQL SSOT.")
+        except Exception as te:
+            logger.warning(f"Note saving Victor's pass to Turso: {te}")
+
+    mark_victors_referral_bound(uid)
+
+save_victors_pass_to_upstash = save_victors_pass_to_turso
+
+
+def safe_post(url: str, json_data: dict, extra_headers: dict = None) -> tuple:
+    """Synchronous POST request wrapper."""
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": VICTORS_ORIGIN,
+        "Referer": f"{VICTORS_ORIGIN}/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Mobile"
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        data_bytes = json.dumps(json_data).encode("utf-8")
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, json.loads(body) if body.startswith("{") or body.startswith("[") else body
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else ""
+        try:
+            return e.code, json.loads(err_body)
+        except Exception:
+            return e.code, err_body
+    except Exception as e:
+        return 0, str(e)
+
+
+def safe_get(url: str, extra_headers: dict = None) -> tuple:
+    """Synchronous GET request wrapper."""
+    headers = {
+        "Origin": VICTORS_ORIGIN,
+        "Referer": f"{VICTORS_ORIGIN}/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Mobile"
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, json.loads(body) if body.startswith("{") or body.startswith("[") else body
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else ""
+        try:
+            return e.code, json.loads(err_body)
+        except Exception:
+            return e.code, err_body
+    except Exception as e:
+        return 0, str(e)
+
+
+def create_victors_ton_proof(wallet_entry: dict, nonce: str) -> tuple:
+    """Signs TonConnect 2.0 proof-of-ownership for Victor's Company."""
+    try:
+        from nacl.signing import SigningKey
+        from tonsdk.contract.wallet import Wallets, WalletVersionEnum
+    except ImportError:
+        logger.error("Missing tonsdk or pynacl. Cannot create TonConnect proof.")
+        return None, None, None, None
+
+    mnemonic = wallet_entry.get("mnemonic") or wallet_entry.get("mnemonic_words")
+    if not mnemonic:
+        return None, None, None, None
+
+    words = mnemonic.split() if isinstance(mnemonic, str) else mnemonic
+    try:
+        _, pub_key_bytes, priv_key_bytes, wallet_contract = Wallets.from_mnemonics(
+            mnemonics=words, version=WalletVersionEnum.v4r2
+        )
+    except Exception:
+        return None, None, None, None
+
+    state_init_res = wallet_contract.create_state_init()
+    state_init_b64 = base64.b64encode(state_init_res["state_init"].to_boc(False)).decode("utf-8")
+
+    t_addr = wallet_contract.address
+    wc = t_addr.wc
+    addr_hash = t_addr.hash_part
+    friendly_addr = t_addr.to_string(is_user_friendly=True, is_bounceable=False, is_url_safe=True)
+    domain = "app.victors.company"
+    timestamp = int(time.time())
+
+    prefix = b"ton-proof-item-v2/"
+    wc_bytes = struct.pack(">i", wc)
+    domain_bytes = domain.encode("utf-8")
+    domain_len = struct.pack("<I", len(domain_bytes))
+    ts_bytes = struct.pack("<Q", timestamp)
+    payload_bytes = nonce.encode("utf-8")
+
+    msg = prefix + wc_bytes + addr_hash + domain_len + domain_bytes + ts_bytes + payload_bytes
+    msg_hash = hashlib.sha256(msg).digest()
+    full_msg = b"\xff\xff" + b"ton-connect" + msg_hash
+    digest = hashlib.sha256(full_msg).digest()
+
+    signing_key = SigningKey(priv_key_bytes[:32])
+    sig = signing_key.sign(digest).signature
+    sig_b64 = base64.b64encode(sig).decode("utf-8")
+
+    proof_item = {
+        "timestamp": timestamp,
+        "domain": {
+            "lengthBytes": len(domain_bytes),
+            "value": domain
+        },
+        "signature": sig_b64,
+        "payload": nonce
+    }
+    return proof_item, state_init_b64, pub_key_bytes.hex(), friendly_addr
+
+
+def fetch_fresh_victors_token_mtproto(uid: int, is_master: bool) -> str:
+    """
+    Directly extracts a fresh WebApp initData token for Victor's Company
+    using the account's Telethon StringSession from Supabase fleet_accounts or accounts.json.
+    Ensures the token auth_date is 0 seconds old to pass Victor's strict 1-hour session limit.
+    """
+    logger.info(f"🔄 UID {uid}: Fetching fresh Victor's Company WebApp token via MTProto...")
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from telethon.tl.functions.messages import RequestAppWebViewRequest
+        from telethon.tl.types import InputBotAppShortName
+    except ImportError:
+        logger.warning(f"UID {uid}: Telethon not installed; cannot refresh via MTProto.")
+        return None
+
+    api_id = int(os.getenv("TELEGRAM_API_ID", "37321306"))
+    api_hash = os.getenv("TELEGRAM_API_HASH", "5cd9e5bbfb572a4429a0c54774153b47")
+    sb_url = os.getenv("SUPABASE_URL") or "https://znbbaozpevurvbfkxakz.supabase.co"
+    sb_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
+    sess_str = None
+    # 1. Try local accounts.json
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                accs = json.load(f)
+                for a in accs:
+                    if str(a.get("user_id") or a.get("account_id") or a.get("id")) == str(uid):
+                        tri = a.get("tri_sessions")
+                        if isinstance(tri, dict) and tri.get("worker"):
+                            sess_str = tri.get("worker")
+                        else:
+                            sess_str = a.get("session_string") or a.get("session")
+                        break
+        except Exception:
+            pass
+
+    # 2. Try Supabase fleet_accounts
+    if not sess_str and sb_url and sb_key:
+        try:
+            req = urllib.request.Request(
+                f"{sb_url}/rest/v1/fleet_accounts?select=id,session_string&id=eq.{uid}",
+                headers={"apikey": sb_key, "Authorization": f"Bearer {sb_key}"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                rows = json.loads(r.read().decode())
+                if rows and isinstance(rows, list):
+                    sess_str = rows[0].get("session_string")
+        except Exception as e:
+            logger.debug(f"UID {uid}: Supabase session query note: {e}")
+
+    if not sess_str:
+        logger.warning(f"UID {uid}: No MTProto StringSession found in local or Supabase.")
+        return None
+
+    async def _extract():
+        runner_id = os.getenv("GITHUB_RUN_ID") or f"victors_{int(time.time())}"
+        lock_key = f"fleet:lock:acc:{uid}"
+        try:
+            from turso_mesh import turso_acquire_lock, turso_release_lock, turso_get
+            if turso_get("fleet:maintenance_mode"):
+                logger.info(f"UID {uid}: Emergency Maintenance Mode active. Skipping MTProto.")
+                return None
+            if not turso_acquire_lock(lock_key, runner_id, ttl_seconds=60):
+                logger.warning(f"UID {uid}: Account locked by another cloud process. Skipping to avoid simultaneous IP collision.")
+                return None
+        except Exception:
+            pass
+
+        cl = TelegramClient(StringSession(sess_str), api_id, api_hash, timeout=12)
+        try:
+            await cl.connect()
+            if not await cl.is_user_authorized():
+                logger.warning(f"UID {uid}: MTProto session not authorized.")
+                return None
+            bot_in = await cl.get_input_entity("Victors_Company_bot")
+            start_p = None if is_master else VICTORS_REF
+            res = await cl(RequestAppWebViewRequest(
+                peer=bot_in,
+                app=InputBotAppShortName(bot_id=bot_in, short_name="app"),
+                platform="android",
+                start_param=start_p
+            ))
+            url = getattr(res, "url", "")
+            p = urllib.parse.urlparse(url)
+            frag = urllib.parse.parse_qs(p.fragment).get("tgWebAppData", [None])[0]
+            if frag and (frag.startswith("user%3D") or "%257B" in frag):
+                frag = urllib.parse.unquote(frag)
+            return frag
+        except Exception as ex:
+            logger.warning(f"UID {uid}: MTProto token extraction error: {ex}")
+            return None
+        finally:
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+            try:
+                from turso_mesh import turso_release_lock
+                turso_release_lock(lock_key, runner_id)
+            except Exception:
+                pass
+
+    try:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        fresh_token = loop.run_until_complete(_extract())
+        loop.close()
+        if fresh_token:
+            logger.info(f"✨ UID {uid}: Successfully extracted fresh Victor's Company token via MTProto!")
+            # Save to Turso LibSQL SSOT
+            try:
+                tok_dict = turso_get(f"fleet:tokens:{uid}") or {}
+                tok_dict["victors_init_data"] = fresh_token
+                tok_dict["victors_updated_at"] = time.time()
+                turso_set(f"fleet:tokens:{uid}", tok_dict)
+            except Exception as ue:
+                logger.debug(f"UID {uid}: Turso token save note: {ue}")
+            return fresh_token
+    except Exception as e:
+        logger.warning(f"UID {uid}: Extraction loop error: {e}")
+
+    return None
+
+
+def probe_account(uid: int, v_init: str, is_master: bool = False) -> tuple:
+    """Rapid health probe to check session validity."""
+    needs_refresh = False
+    try:
+        params = urllib.parse.parse_qs(v_init)
+        ad = params.get("auth_date", [None])[0]
+        if ad:
+            age_sec = time.time() - int(ad)
+            if age_sec > 3000:  # Victor's Company strictly enforces <= 3600s (1h) max age limit
+                logger.info(f"  ⚠️ UID {uid}: Telegram initData is {age_sec/60:.1f}m old (> 50m limit). Requesting fresh MTProto token...")
+                needs_refresh = True
+        else:
+            needs_refresh = True
+    except Exception:
+        needs_refresh = True
+
+    if needs_refresh:
+        fresh_tok = fetch_fresh_victors_token_mtproto(uid, is_master)
+        if fresh_tok:
+            v_init = fresh_tok
+        else:
+            logger.warning(f"  ❌ UID {uid}: Token expired and MTProto refresh unavailable. Skipping.")
+            return "EXPIRED", None, v_init
+
+    existing_hp = get_victors_pass_from_upstash(uid)
+    if existing_hp:
+        code, body = safe_get(
+            f"{VICTORS_API}/me",
+            extra_headers={"Authorization": f"tma {v_init}", "x-human-pass": existing_hp}
+        )
+        if code == 200 and isinstance(body, dict) and body.get("success") is True:
+            return "ALREADY_AUTH", existing_hp, v_init
+
+    # Session requires Turnstile verification: delegate directly to SeleniumBase UC solver
+    return "HUMAN_REQUIRED", None, v_init
+
+
+def run_pipeline_for_account(uid: int, v_init: str, human_pass: str, is_master: bool, ton_wallets: dict):
+    """Executes the full recruitment qualification pipeline."""
+    v_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"tma {v_init}",
+        "x-human-pass": str(human_pass),
+        "Origin": VICTORS_ORIGIN,
+        "Referer": f"{VICTORS_ORIGIN}/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Mobile"
+    }
+
+    try:
+        # 1. Tutorial & checkin
+        safe_post(f"{VICTORS_API}/me/tutorial", {}, extra_headers=v_headers)
+        safe_post(f"{VICTORS_API}/checkin", {}, extra_headers=v_headers)
+
+        # 2. Connect TON wallet with TonConnect 2.0 proof
+        w_entry = ton_wallets.get(str(uid)) or ton_wallets.get(uid)
+        if w_entry and isinstance(w_entry, dict) and (w_entry.get("mnemonic") or w_entry.get("mnemonic_words")):
+            np_code, np_res = safe_get(f"{VICTORS_API}/wallet/proof-payload", extra_headers=v_headers)
+            if np_code == 200 and isinstance(np_res, dict) and np_res.get("payload"):
+                nonce = np_res["payload"]
+                proof_item, state_init_b64, pub_key_hex, friendly_addr = create_victors_ton_proof(w_entry, nonce)
+                if proof_item:
+                    conn_body = {
+                        "address": friendly_addr,
+                        "proof": proof_item,
+                        "stateInit": state_init_b64,
+                        "publicKey": pub_key_hex
+                    }
+                    w_code, _ = safe_post(f"{VICTORS_API}/wallet/connect", conn_body, extra_headers=v_headers)
+                    logger.info(f"💎 UID {uid}: TON wallet {friendly_addr[:10]}... connected ({w_code})")
+
+        # 3. Dynamic Task Discovery & Claims
+        t_code, t_res = safe_get(f"{VICTORS_API}/tasks", extra_headers=v_headers)
+        if t_code == 200 and isinstance(t_res, dict):
+            for t in t_res.get("tasks", []):
+                if isinstance(t, dict) and t.get("status") == "open":
+                    tid = t.get("taskId") or t.get("id")
+                    if tid:
+                        time.sleep(0.3)
+                        c_code, c_res = safe_post(f"{VICTORS_API}/tasks/claim", {"taskId": tid}, extra_headers=v_headers)
+                        if c_code in (200, 201) and isinstance(c_res, dict) and c_res.get("success"):
+                            logger.info(f"🎁 UID {uid}: Claimed task {tid} (+{c_res.get('reward', t.get('reward', 0))} VIC)")
+
+        # 3.1 Special Claimables (Adsgram tasks, rewarded ads, vouchers)
+        safe_post(f"{VICTORS_API}/ad-task/claim", {}, extra_headers=v_headers)
+        safe_post(f"{VICTORS_API}/ad-reward/claim", {}, extra_headers=v_headers)
+        safe_post(f"{VICTORS_API}/thanks-gift/claim", {}, extra_headers=v_headers)
+        safe_post(f"{VICTORS_API}/loss-voucher/cashout-claim", {}, extra_headers=v_headers)
+
+        # 4. Hire Level 1 Miner (Free, unlocks Apprentice mining without home.noJob)
+        u_code, u_res = safe_post(f"{VICTORS_API}/levels/unlock", {"level": 1}, extra_headers=v_headers)
+        logger.info(f"⛏️ UID {uid}: Unlock Level 1 Miner response: {u_code} {u_res}")
+        # Capital Protection: Never auto-spend accumulated coins on costly level upgrades
+
+        # 5. Mining claim
+        c_code, c_res = safe_post(f"{VICTORS_API}/mining/claim", {}, extra_headers=v_headers)
+        logger.info(f"⛏️ UID {uid}: Mining claim response: {c_code} {c_res}")
+
+        # 6. Autonomous Deep Mine Arcade Solver (Rescue active runs only, NEVER on Master Account)
+        if str(uid) != "6727787768":
+            try:
+                import asyncio
+                import aiohttp
+                from victors_arcade_solver import solve_deep_mine_expeditions
+                async def run_arcade():
+                    async with aiohttp.ClientSession() as s:
+                        await solve_deep_mine_expeditions(s, v_headers, f"UID {uid}", max_runs=1)
+                asyncio.run(run_arcade())
+            except Exception as arc_e:
+                logger.debug(f"UID {uid} arcade note: {arc_e}")
+
+    except Exception as e:
+        logger.error(f"UID {uid} pipeline execution exception: {e}")
+
+
+def sweep_master_bonuses(master_uid: int):
+    """Sweeps recruitment hiring bonus (+100 V per qualified recruit) for Master Account."""
+    tok_dict = get_token_from_upstash(master_uid)
+    if not isinstance(tok_dict, dict):
+        tok_dict = robust_json_loads(tok_dict)
+    if not isinstance(tok_dict, dict):
+        tok_dict = {}
+
+    v_init = tok_dict.get("victors_init_data")
+    if not v_init:
+        miniapp_all = load_all_miniapp_tokens()
+        if not isinstance(miniapp_all, dict):
+            miniapp_all = robust_json_loads(miniapp_all)
+        if isinstance(miniapp_all, dict) and str(master_uid) in miniapp_all:
+            m_data = miniapp_all.get(str(master_uid)) or {}
+            if not isinstance(m_data, dict):
+                m_data = robust_json_loads(m_data)
+            if isinstance(m_data, dict):
+                v_init = m_data.get("victors_init_data")
+
+    # Ensure master token is fresh (< 50 minutes old)
+    needs_refresh = False
+    try:
+        if v_init:
+            params = urllib.parse.parse_qs(v_init)
+            ad = params.get("auth_date", [None])[0]
+            if ad and (time.time() - int(ad) > 3000):
+                needs_refresh = True
+        else:
+            needs_refresh = True
+    except Exception:
+        needs_refresh = True
+
+    if needs_refresh:
+        fresh_m = fetch_fresh_victors_token_mtproto(master_uid, is_master=True)
+        if fresh_m:
+            v_init = fresh_m
+
+    if not v_init:
+        logger.info(f"👑 Master UID {master_uid}: Referral link {VICTORS_REF} is active.")
+        return
+
+    hp = get_victors_pass_from_upstash(master_uid)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"tma {v_init}",
+        "Origin": VICTORS_ORIGIN,
+        "Referer": f"{VICTORS_ORIGIN}/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Mobile"
+    }
+    if hp:
+        headers["x-human-pass"] = str(hp)
+
+    b_code, b_res = safe_post(f"{VICTORS_API}/referral/claim-bonus", {}, extra_headers=headers)
+    c_code, c_res = safe_post(f"{VICTORS_API}/referral/claim-commission", {}, extra_headers=headers)
+    logger.info(f"👑 Master recruitment bonus swept: {b_code} {b_res}, commissions: {c_code} {c_res}")
+
+
+def solve_single_account_turnstile(acc: dict, sb_kwargs: dict) -> tuple:
+    """
+    Spawns an isolated SeleniumBase UC browser instance to solve Cloudflare Turnstile
+    for a single fleet account. Returns (success: bool, human_pass: Optional[str]).
+    """
+    uid = acc["uid"]
+    name = acc["name"]
+    v_init = acc["init_data"]
+    is_master = acc["is_master"]
+    ref_to_bind = "" if is_master else VICTORS_REF
+
+    logger.info(f"🚀 [Turnstile Solver] Starting isolated session for UID {uid} ({name}, is_master={is_master})...")
+    encoded_init = urllib.parse.quote(v_init, safe="")
+    target_url = (
+        f"{VICTORS_ORIGIN}/#tgWebAppData={encoded_init}"
+        f"&tgWebAppPlatform=android"
+        f"&tgWebAppVersion=8.0"
+        f"&tgWebAppThemeParams=%7B%22bg_color%22%3A%22%231a1147%22%2C%22text_color%22%3A%22%23ffffff%22%7D"
+    )
+
+    mock_telegram_js = f"""
+        window.__victorsTurnstileToken = null;
+        window.__victorsHumanPass = null;
+
+        try {{
+            sessionStorage.setItem('__telegram__initParams', JSON.stringify({{
+                tgWebAppData: {json.dumps(v_init)},
+                tgWebAppPlatform: 'android',
+                tgWebAppVersion: '8.0'
+            }}));
+            sessionStorage.setItem('initParams', JSON.stringify({{
+                tgWebAppData: {json.dumps(v_init)},
+                tgWebAppPlatform: 'android',
+                tgWebAppVersion: '8.0'
+            }}));
+        }} catch(e) {{}}
+
+        const mockWebApp = {{
+            initData: {json.dumps(v_init)},
+            initDataUnsafe: {{
+                start_param: {json.dumps(ref_to_bind)},
+                user: {{ id: {uid} }}
+            }},
+            version: '8.0',
+            platform: 'android',
+            colorScheme: 'dark',
+            themeParams: {{
+                bg_color: '#1a1147',
+                text_color: '#ffffff',
+                hint_color: '#8b8b8b',
+                link_color: '#ffd700',
+                button_color: '#ffd700',
+                button_text_color: '#000000'
+            }},
+            isExpanded: true,
+            viewportHeight: 915,
+            viewportStableHeight: 915,
+            ready: () => {{}},
+            expand: () => {{}},
+            close: () => {{}},
+            onEvent: () => {{}},
+            offEvent: () => {{}},
+            sendData: () => {{}}
+        }};
+        let _tg = {{ WebApp: mockWebApp }};
+        try {{
+            Object.defineProperty(window, 'Telegram', {{
+                configurable: true,
+                enumerable: true,
+                get: () => _tg,
+                set: (v) => {{
+                    _tg = v || {{}};
+                    if (!_tg.WebApp) _tg.WebApp = mockWebApp;
+                    else {{
+                        _tg.WebApp.initData = {json.dumps(v_init)};
+                        _tg.WebApp.initDataUnsafe = {{
+                            start_param: {json.dumps(ref_to_bind)},
+                            user: {{ id: {uid} }}
+                        }};
+                    }}
+                }}
+            }});
+        }} catch(e) {{}}
+
+        // Intercept window.turnstile.render to hook callback
+        let _cfPoll = setInterval(() => {{
+            if (window.turnstile && typeof window.turnstile.render === 'function') {{
+                clearInterval(_cfPoll);
+                const _origRender = window.turnstile.render;
+                window.turnstile.render = function(container, options) {{
+                    try {{
+                        if (options) {{
+                            options.appearance = 'always';
+                            const _origCb = options.callback;
+                            options.callback = function(tok) {{
+                                window.__victorsTurnstileToken = tok;
+                                if (_origCb) _origCb(tok);
+                            }};
+                        }}
+                    }} catch(e) {{}}
+                    return _origRender.call(this, container, options);
+                }};
+            }}
+        }}, 30);
+
+        // Intercept fetch to capture humanPass from /auth/login response directly
+        const origFetch = window.fetch;
+        window.fetch = async function(...args) {{
+            const url = String(args[0] || '');
+            if (url.includes('/auth/login')) {{
+                try {{
+                    const b = JSON.parse(args[1]?.body || '{{}}');
+                    if (b.turnstileToken) {{
+                        window.__victorsTurnstileToken = b.turnstileToken;
+                    }}
+                }} catch(e) {{}}
+            }}
+            const res = await origFetch.apply(this, args);
+            if (url.includes('/auth/login')) {{
+                try {{
+                    const clone = res.clone();
+                    const data = await clone.json();
+                    if (data && data.humanPass) {{
+                        window.__victorsHumanPass = data.humanPass;
+                    }}
+                }} catch(e) {{}}
+            }}
+            return res;
+        }};
+    """
+
+    human_pass = None
+    token = None
+
+    try:
+        from seleniumbase import SB
+        with SB(**sb_kwargs) as sb:
+            try:
+                sb.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": mock_telegram_js})
+            except Exception as cdp_err:
+                logger.warning(f"CDP script injection note for {uid}: {cdp_err}")
+
+            try:
+                sb.uc_open_with_reconnect(target_url, reconnect_time=4)
+            except Exception:
+                sb.uc_open(target_url)
+            sb.sleep(1.0)
+
+            for attempt in range(25):
+                captured = sb.execute_script("""
+                    let hp = window.__victorsHumanPass || null;
+                    let tok = window.__victorsTurnstileToken || null;
+                    if (!tok) {
+                        let el = document.querySelector('[name="cf-turnstile-response"]');
+                        if (el && el.value) tok = el.value;
+                        if (!tok) {
+                            for (const e of document.querySelectorAll('*')) {
+                                if (e.shadowRoot) {
+                                    let s_el = e.shadowRoot.querySelector('[name="cf-turnstile-response"]');
+                                    if (s_el && s_el.value) { tok = s_el.value; break; }
+                                }
+                            }
+                        }
+                    }
+                    if (!tok && window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                        try { tok = window.turnstile.getResponse() || null; } catch(e) {}
+                    }
+                    return { humanPass: hp, token: tok };
+                """)
+                if captured:
+                    human_pass = captured.get("humanPass")
+                    token = captured.get("token")
+                    if human_pass:
+                        break
+                    if token and len(token) > 20:
+                        break
+
+                # Inject fallback turnstile slot if needed
+                if attempt > 3:
+                    try:
+                        sb.execute_script(f"""
+                            if (window.turnstile && typeof window.turnstile.render === 'function' && !document.getElementById('sb-cf-slot')) {{
+                                let slot = document.createElement('div');
+                                slot.id = 'sb-cf-slot';
+                                slot.style.position = 'fixed';
+                                slot.style.top = '50%';
+                                slot.style.left = '50%';
+                                slot.style.transform = 'translate(-50%, -50%)';
+                                slot.style.width = '300px';
+                                slot.style.height = '65px';
+                                slot.style.zIndex = '9999999';
+                                slot.style.background = '#1a1147';
+                                document.body.appendChild(slot);
+                                window.turnstile.render(slot, {{
+                                    sitekey: '{VICTORS_SITEKEY}',
+                                    action: 'login',
+                                    theme: 'dark',
+                                    appearance: 'always',
+                                    callback: function(tok) {{
+                                        window.__victorsTurnstileToken = tok;
+                                    }}
+                                }});
+                            }}
+                        """)
+                    except Exception:
+                        pass
+
+                # Actively click and handle Cloudflare Turnstile checkbox via SeleniumBase UC GUI
+                if attempt >= 2 and not token and not human_pass:
+                    try:
+                        if hasattr(sb, "uc_gui_click_cf"):
+                            sb.uc_gui_click_cf()
+                        elif hasattr(sb, "uc_gui_handle_cf"):
+                            sb.uc_gui_handle_cf()
+                    except Exception:
+                        pass
+
+                    try:
+                        for frame in sb.driver.find_elements("css selector", "iframe"):
+                            src = frame.get_attribute("src") or ""
+                            if "turnstile" in src or "cloudflare" in src or "challenge" in src:
+                                sb.driver.switch_to.frame(frame)
+                                try:
+                                    cb = sb.driver.find_element("css selector", "input[type='checkbox'], .mark, #challenge-stage")
+                                    cb.click()
+                                except Exception:
+                                    pass
+                                sb.driver.switch_to.default_content()
+                    except Exception:
+                        try:
+                            sb.driver.switch_to.default_content()
+                        except Exception:
+                            pass
+
+                sb.sleep(1.0)
+
+            if token and not human_pass:
+                logger.info(f"✅ UID {uid}: Cloudflare Turnstile token obtained ({token[:16]}...)!")
+                login_p = {
+                    "turnstileToken": token,
+                    "device": {
+                        "platform": "android",
+                        "tgVersion": "8.0",
+                        "screen": "430x932@3",
+                        "ram": 8,
+                        "cpu": 8
+                    }
+                }
+                if not is_master:
+                    login_p["startParam"] = VICTORS_REF
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"tma {v_init}",
+                    "Origin": VICTORS_ORIGIN,
+                    "Referer": f"{VICTORS_ORIGIN}/",
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Mobile"
+                }
+                st_code, body = safe_post(f"{VICTORS_API}/auth/login", login_p, extra_headers=headers)
+                if st_code in (200, 201) and isinstance(body, dict):
+                    human_pass = body.get("humanPass") or (body.get("data", {}).get("humanPass") if isinstance(body.get("data"), dict) else None)
+                else:
+                    logger.warning(f"UID {uid} /auth/login error: {st_code} {body}")
+
+    except Exception as e:
+        logger.error(f"UID {uid} browser solver error: {e}")
+
+    if human_pass:
+        return True, str(human_pass)
+    return False, None
+
+
+def solve_victors_with_seleniumbase():
+    """Main execution using SeleniumBase UC mode to solve Turnstile for Victor's accounts."""
+    try:
+        from seleniumbase import SB
+    except ImportError:
+        logger.error("SeleniumBase not installed. Please install with: pip install seleniumbase")
+        return
+
+    ton_wallets = load_fleet_ton_wallets()
+    if not isinstance(ton_wallets, dict):
+        ton_wallets = robust_json_loads(ton_wallets)
+    if not isinstance(ton_wallets, dict):
+        ton_wallets = {}
+
+    miniapp_all = load_all_miniapp_tokens()
+    if not isinstance(miniapp_all, dict):
+        miniapp_all = robust_json_loads(miniapp_all)
+    if not isinstance(miniapp_all, dict):
+        miniapp_all = {}
+    raw_accounts = []
+
+    for uid in FLEET_UIDS:
+        tok_dict = get_token_from_upstash(uid)
+        if not isinstance(tok_dict, dict):
+            tok_dict = robust_json_loads(tok_dict)
+        if not isinstance(tok_dict, dict):
+            tok_dict = {}
+
+        vic_init = tok_dict.get("victors_init_data")
+        name = tok_dict.get("name")
+        if not vic_init and str(uid) in miniapp_all:
+            acc_extra = miniapp_all.get(str(uid), {})
+            if not isinstance(acc_extra, dict):
+                acc_extra = robust_json_loads(acc_extra)
+            if isinstance(acc_extra, dict):
+                vic_init = acc_extra.get("victors_init_data")
+                name = acc_extra.get("name")
+        name = name or f"UID {uid}"
+        if vic_init:
+            raw_accounts.append({
+                "uid": uid,
+                "name": name,
+                "init_data": vic_init,
+                "is_master": (uid == 6727787768 or str(uid) == str(OWNER_ID))
+            })
+
+    logger.info(f"🏢 Found {len(raw_accounts)} accounts with Victor's Company initData. Running pre-flight probe...")
+
+    active_accounts = []
+    solved_count = 0
+
+    for acc in raw_accounts:
+        uid = acc["uid"]
+        status, data, v_init = probe_account(uid, acc["init_data"], acc["is_master"])
+        acc["init_data"] = v_init
+        if status == "HUMAN_REQUIRED":
+            logger.info(f"  👉 UID {uid} ({acc['name']}): Session valid -> READY for Turnstile.")
+            active_accounts.append(acc)
+        elif status == "ALREADY_AUTH":
+            logger.info(f"  ✅ UID {uid} ({acc['name']}): Already authenticated! Running qualification...")
+            save_victors_pass_to_upstash(uid, data)
+            run_pipeline_for_account(uid, v_init, data, acc["is_master"], ton_wallets)
+            solved_count += 1
+        elif status == "EXPIRED":
+            logger.warning(f"  ⚠️ UID {uid} ({acc['name']}): Session expired. Skipping.")
+        else:
+            active_accounts.append(acc)
+
+    sb_kwargs = {"uc": True, "test": True, "xvfb": True, "locale": "en", "ad_block": False}
+    proxy_val = os.getenv("PROXY") or os.getenv("HTTP_PROXY")
+    if proxy_val:
+        sb_kwargs["proxy"] = proxy_val
+        logger.info(f"🌐 Routing SeleniumBase UC through proxy: {proxy_val.split('@')[-1] if '@' in proxy_val else proxy_val[:20]}...")
+
+    if not active_accounts:
+        logger.info("No accounts currently requiring Turnstile for Victor's. Checking Master bonuses...")
+        sweep_master_bonuses(6727787768)
+    else:
+        logger.info(f"⚡ Running SeleniumBase UC mode stealth solver across {len(active_accounts)} accounts (process-isolated)...")
+
+        for acc in active_accounts:
+            uid = acc["uid"]
+            name = acc["name"]
+            v_init = acc["init_data"]
+            is_master = acc["is_master"]
+
+            ok, human_pass = solve_single_account_turnstile(acc, sb_kwargs)
+            if ok and human_pass:
+                logger.info(f"🎉 UID {uid}: Acquired humanPass ({human_pass[:16]}...)! Executing qualification pipeline...")
+                save_victors_pass_to_upstash(uid, str(human_pass))
+                run_pipeline_for_account(uid, v_init, str(human_pass), is_master, ton_wallets)
+                solved_count += 1
+                send_tg_alert(f"✅ <b>Victor's Recruit Qualified ({solved_count}/{len(raw_accounts)})</b>\nUID: <code>{uid}</code> bound to <code>{VICTORS_REF}</code>!")
+            else:
+                logger.warning(f"⚠️ UID {uid} ({name}): Turnstile could not be solved in this cycle.")
+            time.sleep(1.0)
+
+        sweep_master_bonuses(6727787768)
+
+        report_msg = (
+            f"🏢 <b>VICTOR'S COMPANY CLOUD TURNSTILE SOLVER REPORT</b> 🛡️\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 <b>Accounts Processed:</b> <code>{len(raw_accounts)} Fleet Accounts</code>\n"
+            f"🎯 <b>Turnstile Solved & Qualified:</b> <b>{solved_count}/{len(raw_accounts)} Qualified</b> 🟢\n"
+            f"🔗 <b>Master Referral Bound:</b> <code>{VICTORS_REF}</code>\n"
+            f"🕒 <b>Execution Timestamp:</b> <code>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <i>100% Cloud Execution (SeleniumBase UC Stealth & CDP Native). Zero phone load.</i>"
+        )
+        logger.info(f"📢 Final: {solved_count}/{len(raw_accounts)} accounts solved & qualified.")
+        send_tg_alert(report_msg)
+
+
+
+if __name__ == "__main__":
+    solve_victors_with_seleniumbase()
