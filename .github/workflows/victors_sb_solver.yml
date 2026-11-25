@@ -8,6 +8,10 @@ on:
         required: false
         default: "all"
 
+concurrency:
+  group: victors-turnstile-solver
+  cancel-in-progress: false
+
 jobs:
   solve_and_qualify_victors:
     runs-on: ubuntu-latest
