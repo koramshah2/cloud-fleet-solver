@@ -506,23 +506,35 @@ def fetch_fresh_victors_token_mtproto(uid: int, is_master: bool) -> str:
     sb_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 
     sess_str = None
-    # 1. Try local accounts.json
-    if os.path.exists(ACCOUNTS_FILE):
+    # 1. Prefer isolated `backup` session from Turso fleet:tri_sessions:{uid} or local accounts.json
+    #    so GitHub Actions US runners NEVER clash with Northflank EU worker sessions (AuthKeyDuplicatedError).
+    try:
+        tri_raw = turso_get(f"fleet:tri_sessions:{uid}")
+        if isinstance(tri_raw, str) and tri_raw.strip().startswith("{"):
+            tri_raw = json.loads(tri_raw)
+        if isinstance(tri_raw, dict):
+            sess_obj = tri_raw.get("sessions") if isinstance(tri_raw.get("sessions"), dict) else tri_raw
+            sess_str = sess_obj.get("backup") or sess_obj.get("sentinel")
+    except Exception:
+        pass
+
+    # 2. Fallback to local accounts.json (backup -> sentinel -> worker)
+    if not sess_str and os.path.exists(ACCOUNTS_FILE):
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                 accs = json.load(f)
                 for a in accs:
                     if str(a.get("user_id") or a.get("account_id") or a.get("id")) == str(uid):
                         tri = a.get("tri_sessions")
-                        if isinstance(tri, dict) and tri.get("worker"):
-                            sess_str = tri.get("worker")
-                        else:
+                        if isinstance(tri, dict):
+                            sess_str = tri.get("backup") or tri.get("sentinel") or tri.get("worker")
+                        if not sess_str:
                             sess_str = a.get("session_string") or a.get("session")
                         break
         except Exception:
             pass
 
-    # 2. Try Supabase fleet_accounts
+    # 3. Last-resort Supabase fleet_accounts fallback
     if not sess_str and sb_url and sb_key:
         try:
             req = urllib.request.Request(
