@@ -349,12 +349,16 @@ def save_victors_pass_to_turso(uid: int, human_pass: str):
                         "args": [{"type": "text", "value": f"victors:pass:{uid}"}, {"type": "text", "value": val}, {"type": "integer", "value": now_ts_str}]
                     }},
                     {"type": "execute", "stmt": {
-                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.' || ? || '.victors_pass', ?) WHERE key = 'miniapp_tokens';",
-                        "args": [{"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}]
+                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.' || ? || '.victors_pass', ?, '$.' || ? || '.victors_human_pass', ?) WHERE key = 'miniapp_tokens';",
+                        "args": [{"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}, {"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}]
                     }},
                     {"type": "execute", "stmt": {
-                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.' || ? || '.victors_pass', ?) WHERE key = 'fleet:tokens_state';",
-                        "args": [{"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}]
+                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.' || ? || '.victors_pass', ?, '$.' || ? || '.victors_human_pass', ?) WHERE key = 'fleet:tokens_state';",
+                        "args": [{"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}, {"type": "text", "value": str(uid)}, {"type": "text", "value": human_pass}]
+                    }},
+                    {"type": "execute", "stmt": {
+                        "sql": "UPDATE kv_mesh SET val = json_set(val, '$.victors_pass', ?, '$.victors_human_pass', ?) WHERE key = ?;",
+                        "args": [{"type": "text", "value": human_pass}, {"type": "text", "value": human_pass}, {"type": "text", "value": f"fleet:tokens:{uid}"}]
                     }},
                     {"type": "close"}
                 ]
