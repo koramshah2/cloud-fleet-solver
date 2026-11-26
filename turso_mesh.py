@@ -155,16 +155,138 @@ def turso_get(key: str, default: Any = None) -> Any:
         return decoded if decoded is not None else default
     return default
 
+def build_accounts_slim(accounts: list) -> list:
+    """Builds a lightweight (~5 KB) roster projection for sub-250ms Edge & Admin Bot UI queries."""
+    slim = []
+    for a in (accounts or []):
+        if not isinstance(a, dict):
+            continue
+        tri = a.get("tri_sessions") if isinstance(a.get("tri_sessions"), dict) else {}
+        s_obj = tri.get("sessions") if isinstance(tri.get("sessions"), dict) else tri
+        w_ok = bool(isinstance(s_obj, dict) and str(s_obj.get("worker") or "").strip())
+        s_ok = bool(isinstance(s_obj, dict) and str(s_obj.get("sentinel") or "").strip())
+        b_ok = bool(isinstance(s_obj, dict) and str(s_obj.get("backup") or "").strip())
+        has_sess = bool(
+            (isinstance(a.get("session_string"), str) and len(a["session_string"].strip()) > 20)
+            or (isinstance(a.get("session"), str) and len(a["session"].strip()) > 20)
+            or w_ok or s_ok or b_ok
+        )
+        slim.append({
+            "index": a.get("index"),
+            "id": str(a.get("user_id") or a.get("id") or ""),
+            "user_id": a.get("user_id"),
+            "name": a.get("name", ""),
+            "username": a.get("username", ""),
+            "phone": a.get("phone", ""),
+            "status": a.get("status", "active"),
+            "session_revoked": bool(a.get("session_revoked", False)),
+            "added_at": a.get("added_at", ""),
+            "email": a.get("email") or a.get("login_email") or "",
+            "has_session": has_sess,
+            "has_worker": w_ok,
+            "has_sentinel": s_ok,
+            "has_backup": b_ok,
+            "miniapp_tokens_synced": bool(
+                a.get("miniapp_tokens_synced") or a.get("atf_init_data") or a.get("kynex_init_data")
+            ),
+        })
+    slim.sort(key=lambda x: int(x.get("index") or 999))
+    return slim
+
+
+def build_tokens_summary(tokens_map: dict) -> dict:
+    """Builds a tiny (~2 KB) per-account pool availability summary from miniapp tokens."""
+    summary = {}
+    if not isinstance(tokens_map, dict):
+        return summary
+    for uid, tok in tokens_map.items():
+        if not isinstance(tok, dict):
+            continue
+        pools = []
+        if tok.get("atf_init_data"):
+            pools.append("ATF")
+        if tok.get("kynex_init_data"):
+            pools.append("KYN")
+        if tok.get("pepegram_init_data") or tok.get("pepe_init_data"):
+            pools.append("PEP")
+        if tok.get("adxearn_init_data") or tok.get("adx_init_data"):
+            pools.append("ADX")
+        if tok.get("chickenland_init_data") or tok.get("chicken_init_data"):
+            pools.append("CHK")
+        if tok.get("earnvault_init_data") or tok.get("earnvault_refresh_token"):
+            pools.append("EV")
+        if tok.get("mexo_token") or tok.get("mexo_init_data"):
+            pools.append("MXO")
+        if tok.get("myage_init_data"):
+            pools.append("AGE")
+        summary[str(uid)] = {
+            "pools": pools,
+            "count": len(pools),
+            "synced_at": tok.get("synced_at") or tok.get("updated_at") or 0,
+        }
+    return summary
+
+
 def turso_set(key: str, value: Any, ttl: Optional[int] = None) -> bool:
     """
     Persists a key-value pair to `kv_mesh` table in Turso LibSQL.
-    Serializes non-string objects to JSON.
+    Serializes non-string objects to JSON and automatically mirrors lightweight
+    UI projections (`fleet:accounts_slim`, `fleet:tokens_summary`) in a single batch.
     """
     if value is None:
         return turso_delete(key)
 
     val_str = json.dumps(value) if not isinstance(value, str) else value
     now_ts = int(time.time())
+
+    # Auto-sync compact edge projections in the same atomic pipeline roundtrip
+    if key == "fleet:accounts":
+        try:
+            accs = json.loads(val_str) if isinstance(value, str) else value
+            if isinstance(accs, list) and len(accs) > 0:
+                slim_str = json.dumps(build_accounts_slim(accs))
+                return turso_execute_batch([
+                    {
+                        "type": "execute",
+                        "stmt": {
+                            "sql": "INSERT OR REPLACE INTO kv_mesh (key, val, updated_at) VALUES (?, ?, ?);",
+                            "args": [_format_hrana_arg(key), _format_hrana_arg(val_str), _format_hrana_arg(now_ts)],
+                        },
+                    },
+                    {
+                        "type": "execute",
+                        "stmt": {
+                            "sql": "INSERT OR REPLACE INTO kv_mesh (key, val, updated_at) VALUES (?, ?, ?);",
+                            "args": [_format_hrana_arg("fleet:accounts_slim"), _format_hrana_arg(slim_str), _format_hrana_arg(now_ts)],
+                        },
+                    },
+                ]) is not None
+        except Exception:
+            pass
+    elif key in ("fleet:tokens_state", "miniapp_tokens"):
+        try:
+            tmap = json.loads(val_str) if isinstance(value, str) else value
+            if isinstance(tmap, dict) and len(tmap) > 0:
+                sum_str = json.dumps(build_tokens_summary(tmap))
+                return turso_execute_batch([
+                    {
+                        "type": "execute",
+                        "stmt": {
+                            "sql": "INSERT OR REPLACE INTO kv_mesh (key, val, updated_at) VALUES (?, ?, ?);",
+                            "args": [_format_hrana_arg(key), _format_hrana_arg(val_str), _format_hrana_arg(now_ts)],
+                        },
+                    },
+                    {
+                        "type": "execute",
+                        "stmt": {
+                            "sql": "INSERT OR REPLACE INTO kv_mesh (key, val, updated_at) VALUES (?, ?, ?);",
+                            "args": [_format_hrana_arg("fleet:tokens_summary"), _format_hrana_arg(sum_str), _format_hrana_arg(now_ts)],
+                        },
+                    },
+                ]) is not None
+        except Exception:
+            pass
+
     rows = turso_execute(
         "INSERT OR REPLACE INTO kv_mesh (key, val, updated_at) VALUES (?, ?, ?);",
         [key, val_str, now_ts]
