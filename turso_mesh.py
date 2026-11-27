@@ -187,7 +187,7 @@ def build_accounts_slim(accounts: list) -> list:
             "has_sentinel": s_ok,
             "has_backup": b_ok,
             "miniapp_tokens_synced": bool(
-                a.get("miniapp_tokens_synced") or a.get("atf_init_data") or a.get("kynex_init_data")
+                a.get("miniapp_tokens_synced") or a.get("atf_init_data") or a.get("chickenland_init_data") or a.get("pepegram_init_data")
             ),
         })
     slim.sort(key=lambda x: int(x.get("index") or 999))
@@ -205,12 +205,8 @@ def build_tokens_summary(tokens_map: dict) -> dict:
         pools = []
         if tok.get("atf_init_data"):
             pools.append("ATF")
-        if tok.get("kynex_init_data"):
-            pools.append("KYN")
         if tok.get("pepegram_init_data") or tok.get("pepe_init_data"):
             pools.append("PEP")
-        if tok.get("adxearn_init_data") or tok.get("adx_init_data"):
-            pools.append("ADX")
         if tok.get("chickenland_init_data") or tok.get("chicken_init_data"):
             pools.append("CHK")
         if tok.get("moovalley_init_data") or tok.get("moo_init_data"):
