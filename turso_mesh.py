@@ -213,12 +213,16 @@ def build_tokens_summary(tokens_map: dict) -> dict:
             pools.append("ADX")
         if tok.get("chickenland_init_data") or tok.get("chicken_init_data"):
             pools.append("CHK")
+        if tok.get("moovalley_init_data") or tok.get("moo_init_data"):
+            pools.append("MOO")
         if tok.get("earnvault_init_data") or tok.get("earnvault_refresh_token"):
             pools.append("EV")
         if tok.get("mexo_token") or tok.get("mexo_init_data"):
             pools.append("MXO")
         if tok.get("myage_init_data"):
             pools.append("AGE")
+        if tok.get("nautilus_init_data") or tok.get("nautilusmine_init_data"):
+            pools.append("NAU")
         summary[str(uid)] = {
             "pools": pools,
             "count": len(pools),
